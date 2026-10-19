@@ -75,6 +75,7 @@ import com.github.damontecres.wholphin.services.MusicServiceState
 import com.github.damontecres.wholphin.services.NavigationManager
 import com.github.damontecres.wholphin.services.PlaylistCreator
 import com.github.damontecres.wholphin.services.ServerReportService
+import com.github.damontecres.wholphin.ui.DEFAULT_PAGE_SIZE
 import com.github.damontecres.wholphin.ui.FontAwesome
 import com.github.damontecres.wholphin.ui.SlimItemFields
 import com.github.damontecres.wholphin.ui.cards.ItemCardImage
@@ -126,13 +127,20 @@ import dagger.assisted.AssistedInject
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import org.jellyfin.sdk.api.client.ApiClient
 import org.jellyfin.sdk.api.client.exception.InvalidStatusException
+import org.jellyfin.sdk.api.client.extensions.itemsApi
 import org.jellyfin.sdk.api.client.extensions.playlistsApi
 import org.jellyfin.sdk.api.client.extensions.userLibraryApi
+import org.jellyfin.sdk.model.api.BaseItemDto
 import org.jellyfin.sdk.model.api.BaseItemKind
 import org.jellyfin.sdk.model.api.ImageType
 import org.jellyfin.sdk.model.api.ItemSortBy
@@ -143,6 +151,9 @@ import org.jellyfin.sdk.model.extensions.ticks
 import timber.log.Timber
 import java.util.UUID
 import kotlin.time.Duration
+
+private const val MAX_EXPANDED_PLAYLIST_ENTRIES = 1000
+private const val MAX_CONCURRENT_COLLECTION_FETCHES = 4
 
 @HiltViewModel(assistedFactory = PlaylistViewModel.Factory::class)
 class PlaylistViewModel
@@ -249,6 +260,7 @@ class PlaylistViewModel
             state.update {
                 it.copy(
                     loading = LoadingState.Loading,
+                    rowSources = null,
                     filterAndSort = FilterAndSort(filter, sortAndDirection),
                 )
             }
@@ -283,28 +295,178 @@ class PlaylistViewModel
                         ),
                     )
                 try {
-                    val pager =
-                        ApiRequestPager(
-                            api,
-                            request,
-                            GetItemsRequestHandler,
-                            viewModelScope,
-                        ).init()
-                    state.update {
-                        it.copy(
-                            items = pager,
-                            loading = LoadingState.Success,
-                        )
+                    if (playlistContainsBoxSets(request)) {
+                        val rows = loadExpandedRows(request, filter, sortAndDirection, user.id)
+                        if (rows != null) {
+                            state.update {
+                                it.copy(
+                                    items = rows.items,
+                                    rowSources = rows.sources,
+                                    loading = LoadingState.Success,
+                                )
+                            }
+                        } else {
+                            loadPagedItems(request)
+                        }
+                    } else {
+                        loadPagedItems(request)
                     }
                 } catch (ex: Exception) {
                     Timber.e(ex, "Error fetching playlist %s", itemId)
                     state.update {
                         it.copy(
                             items = emptyList(),
+                            rowSources = null,
                             loading = LoadingState.Error(ex),
                         )
                     }
                 }
+            }
+        }
+
+        private suspend fun loadPagedItems(request: GetItemsRequest) {
+            val pager =
+                ApiRequestPager(
+                    api,
+                    request,
+                    GetItemsRequestHandler,
+                    viewModelScope,
+                ).init()
+            state.update {
+                it.copy(
+                    items = pager,
+                    rowSources = null,
+                    loading = LoadingState.Success,
+                )
+            }
+        }
+
+        /**
+         * Whether the playlist contains at least one collection ([BaseItemKind.BOX_SET]) entry
+         *
+         * Uses a cheap count query; on failure it falls back to `false` (regular paged list, collections
+         * shown as single rows).
+         */
+        private suspend fun playlistContainsBoxSets(request: GetItemsRequest): Boolean =
+            try {
+                val includeTypes = request.includeItemTypes
+                if (includeTypes != null && BaseItemKind.BOX_SET !in includeTypes) {
+                    false
+                } else {
+                    val countRequest =
+                        request.copy(
+                            includeItemTypes = listOf(BaseItemKind.BOX_SET),
+                            startIndex = 0,
+                            limit = 1,
+                            enableTotalRecordCount = true,
+                        )
+                    val result = api.itemsApi.getItems(countRequest).content
+                    (result.totalRecordCount ?: 0) > 0
+                }
+            } catch (ex: CancellationException) {
+                throw ex
+            } catch (ex: Exception) {
+                Timber.w(ex, "Could not detect collections in playlist %s", itemId)
+                false
+            }
+
+        /**
+         * Load every playlist entry eagerly and expand each collection into its children
+         *
+         * Returns `null` on failure so the caller can fall back to the regular paged list.
+         */
+        private suspend fun loadExpandedRows(
+            request: GetItemsRequest,
+            filter: GetItemsFilter,
+            sortAndDirection: SortAndDirection,
+            userId: UUID,
+        ): ExpandedPlaylistRows? =
+            try {
+                val raw = mutableListOf<BaseItemDto>()
+                var startIndex = 0
+                while (raw.size < MAX_EXPANDED_PLAYLIST_ENTRIES) {
+                    val page =
+                        api.itemsApi
+                            .getItems(
+                                request.copy(
+                                    startIndex = startIndex,
+                                    limit = DEFAULT_PAGE_SIZE,
+                                    enableTotalRecordCount = true,
+                                ),
+                            ).content
+                    if (page.items.isEmpty()) break
+                    raw.addAll(page.items)
+                    startIndex += page.items.size
+                    val total = page.totalRecordCount
+                    if (total != null && startIndex >= total) break
+                }
+                val childrenById = fetchCollectionChildren(raw, filter, sortAndDirection, userId)
+                buildExpandedPlaylistRows(raw, childrenById)
+            } catch (ex: CancellationException) {
+                throw ex
+            } catch (ex: Exception) {
+                Timber.e(ex, "Error expanding playlist %s", itemId)
+                null
+            }
+
+        private suspend fun fetchCollectionChildren(
+            raw: List<BaseItemDto>,
+            filter: GetItemsFilter,
+            sortAndDirection: SortAndDirection,
+            userId: UUID,
+        ): Map<UUID, List<BaseItemDto>> {
+            val boxSets = raw.filter { it.type == BaseItemKind.BOX_SET }
+            if (boxSets.isEmpty()) return emptyMap()
+            val semaphore = Semaphore(MAX_CONCURRENT_COLLECTION_FETCHES)
+            val results =
+                coroutineScope {
+                    boxSets
+                        .map { boxSet ->
+                            async {
+                                semaphore.withPermit {
+                                    try {
+                                        boxSet.id to
+                                            playlistCreator.getCollectionChildren(
+                                                boxSet = boxSet,
+                                                filter = filter,
+                                                sortAndDirection = sortAndDirection,
+                                                fields = SlimItemFields,
+                                                userId = userId,
+                                            )
+                                    } catch (ex: CancellationException) {
+                                        throw ex
+                                    } catch (ex: Exception) {
+                                        Timber.w(
+                                            ex,
+                                            "Could not expand collection %s in playlist %s",
+                                            boxSet.id,
+                                            itemId,
+                                        )
+                                        boxSet.id to null
+                                    }
+                                }
+                            }
+                        }.awaitAll()
+                }
+            return results
+                .mapNotNull { (id, children) -> children?.let { id to it } }
+                .toMap()
+        }
+
+        /**
+         * Refresh the items after a playlist entry was removed or moved
+         *
+         * The expanded list is not paged, so it is reloaded entirely.
+         *
+         * @param pagerPosition the position used to invalidate pages when the paged list is active
+         */
+        private suspend fun refreshAfterPlaylistChange(pagerPosition: Int) {
+            val items = state.value.items
+            if (items is ApiRequestPager<*>) {
+                items.refreshPagesAfter(pagerPosition)
+            } else {
+                val current = state.value.filterAndSort
+                loadItems(current.filter, current.sortAndDirection).join()
             }
         }
 
@@ -322,12 +484,16 @@ class PlaylistViewModel
             mediaType =
                 if (mediaType == MediaType.UNKNOWN) {
                     // Otherwise, if a most of the list is one type, we can assume that type
-                    val pager = (state.value.items as? ApiRequestPager<*>)
-                    if (pager != null && pager.size <= 50) {
-                        val types =
-                            (0..<50.coerceAtMost(pager.size)).groupBy { index ->
-                                val pagerItem = pager.getBlocking(index)
-                                when (pagerItem?.type) {
+                    val items = state.value.items
+                    val types =
+                        if (items.size <= 50) {
+                            (0 until items.size).groupBy { index ->
+                                val sampleItem =
+                                    when (items) {
+                                        is ApiRequestPager<*> -> items.getBlocking(index)
+                                        else -> items[index]
+                                    }
+                                when (sampleItem?.type) {
                                     BaseItemKind.AUDIO -> MediaType.AUDIO
 
                                     BaseItemKind.VIDEO,
@@ -339,11 +505,11 @@ class PlaylistViewModel
                                     else -> MediaType.UNKNOWN
                                 }
                             }
-                        if (types.keys.size == 1) {
-                            types.keys.first()
                         } else {
-                            MediaType.UNKNOWN
+                            emptyMap()
                         }
+                    if (types.keys.size == 1) {
+                        types.keys.first()
                     } else {
                         MediaType.UNKNOWN
                     }
@@ -391,19 +557,21 @@ class PlaylistViewModel
             itemId: UUID,
         ) {
             viewModelScope.launchIO {
+                val source = state.value.rowSources?.getOrNull(index)
+                val entryItemId = source?.sourceItemId ?: itemId
                 try {
                     playlistCreator.removeFromServerPlaylist(
                         playlistId = this@PlaylistViewModel.itemId,
-                        itemId = itemId,
+                        itemId = entryItemId,
                     )
-                    (state.value.items as? ApiRequestPager<*>)?.refreshPagesAfter(index)
+                    refreshAfterPlaylistChange(index)
                 } catch (ex: CancellationException) {
                     throw ex
                 } catch (ex: Exception) {
                     Timber.e(
                         ex,
                         "Error removing %s from playlist %s",
-                        itemId,
+                        entryItemId,
                         this@PlaylistViewModel.itemId,
                     )
                     showToast(context, "Error: ${ex.localizedMessage}")
@@ -417,13 +585,16 @@ class PlaylistViewModel
             direction: MoveDirection,
         ) {
             viewModelScope.launchIO {
-                val newIndex = index + if (direction == MoveDirection.UP) -1 else 1
+                val source = state.value.rowSources?.getOrNull(index)
+                val entryIndex = source?.sourceIndex ?: index
+                val entryItemId = source?.sourceItemId ?: itemId
+                val newIndex = entryIndex + if (direction == MoveDirection.UP) -1 else 1
                 api.playlistsApi.moveItem(
                     playlistId = this@PlaylistViewModel.itemId.toServerString(),
-                    itemId = itemId.toServerString(),
+                    itemId = entryItemId.toServerString(),
                     newIndex = newIndex,
                 )
-                (state.value.items as? ApiRequestPager<*>)?.refreshPagesAfter(index - 1)
+                refreshAfterPlaylistChange(entryIndex - 1)
             }
         }
     }
@@ -434,10 +605,73 @@ data class FilterAndSort(
     val sortAndDirection: SortAndDirection,
 )
 
+/**
+ * Where a row of the playlist details list comes from
+ *
+ * Rows expanded from a collection share the [sourceItemId] of the collection entry they belong to, so
+ * playlist actions (remove/move) can target the actual playlist entry.
+ */
+@Immutable
+data class PlaylistRowSource(
+    val sourceIndex: Int,
+    val sourceItemId: UUID,
+    val expanded: Boolean,
+)
+
+@Immutable
+data class PendingPlay(
+    val startIndex: Int,
+    val item: BaseItem,
+    val shuffle: Boolean,
+    val startItemId: UUID?,
+)
+
+data class ExpandedPlaylistRows(
+    val items: List<BaseItem>,
+    val sources: List<PlaylistRowSource>,
+)
+
+/**
+ * Flatten the raw playlist entries, replacing each collection ([BaseItemKind.BOX_SET]) with its [childrenById]
+ *
+ * A collection with no children (or missing from [childrenById]) stays as a single collection row so the
+ * entry is never lost.
+ */
+fun buildExpandedPlaylistRows(
+    raw: List<BaseItemDto>,
+    childrenById: Map<UUID, List<BaseItemDto>>,
+): ExpandedPlaylistRows {
+    val items = mutableListOf<BaseItem>()
+    val sources = mutableListOf<PlaylistRowSource>()
+    raw.forEachIndexed { index, entry ->
+        val children =
+            if (entry.type == BaseItemKind.BOX_SET) {
+                childrenById[entry.id].orEmpty()
+            } else {
+                emptyList()
+            }
+        if (children.isNotEmpty()) {
+            children.forEach { child ->
+                items.add(BaseItem(child, false))
+                sources.add(PlaylistRowSource(index, entry.id, true))
+            }
+        } else {
+            items.add(BaseItem(entry, false))
+            sources.add(PlaylistRowSource(index, entry.id, false))
+        }
+    }
+    return ExpandedPlaylistRows(items, sources)
+}
+
 data class PlaylistDetailsState(
     val playlist: BaseItem? = null,
     val mediaType: MediaType = MediaType.UNKNOWN,
     val items: List<BaseItem?> = emptyList(),
+    /**
+     * Present only when the playlist contains collections and [items] was expanded eagerly; `null` means
+     * [items] is the regular paged list of raw playlist entries (row index == playlist entry index).
+     */
+    val rowSources: List<PlaylistRowSource>? = null,
     val filterAndSort: FilterAndSort =
         FilterAndSort(
             filter = GetItemsFilter(),
@@ -466,43 +700,74 @@ fun PlaylistDetails(
     val musicState by viewModel.musicState.collectAsState()
 
     var showContextMenu by remember { mutableStateOf<ContextMenu?>(null) }
-    var showConfirmTypeDialog by remember { mutableStateOf<Triple<Int, BaseItem, Boolean>?>(null) }
+    var showConfirmTypeDialog by remember { mutableStateOf<PendingPlay?>(null) }
     var showPlaylistDialog by remember { mutableStateOf<Optional<UUID>>(Optional.absent()) }
     val addPlaylistState by addToPlaylistViewModel.playlistState.collectAsState()
 
-    fun play(
-        index: Int,
+    fun playEntry(
+        startIndex: Int,
         item: BaseItem,
         shuffle: Boolean,
         mediaTypeOverride: MediaType? = null,
+        startItemId: UUID? = null,
     ) {
         when (mediaTypeOverride ?: state.mediaType) {
             MediaType.VIDEO -> {
                 viewModel.navigationManager.navigateTo(
                     Destination.PlaybackList(
                         itemId = destination.itemId,
-                        startIndex = index,
+                        startIndex = startIndex,
                         shuffle = shuffle,
                         filter = state.filterAndSort.filter,
                         sortAndDirection = state.filterAndSort.sortAndDirection,
+                        startItemId = startItemId,
                     ),
                 )
             }
 
             MediaType.AUDIO -> {
-                viewModel.play(item, index, shuffle)
+                viewModel.play(item, startIndex, shuffle)
             }
 
             else -> {
-                showConfirmTypeDialog = Triple(index, item, shuffle)
+                showConfirmTypeDialog = PendingPlay(startIndex, item, shuffle, startItemId)
             }
         }
+    }
+
+    fun isExpandedRow(
+        index: Int,
+        item: BaseItem,
+    ): Boolean {
+        val source = state.rowSources?.getOrNull(index)
+        return source != null && source.expanded && item.id != state.playlist?.id
+    }
+
+    fun play(
+        index: Int,
+        item: BaseItem,
+        shuffle: Boolean,
+    ) {
+        playEntry(
+            startIndex = state.rowSources?.getOrNull(index)?.sourceIndex ?: index,
+            item = item,
+            shuffle = shuffle,
+            startItemId = if (isExpandedRow(index, item)) item.id else null,
+        )
     }
     val musicContextActions =
         remember {
             MusicContextActions(
                 navigateTo = { viewModel.navigationManager.navigateTo(it) },
-                onClickPlay = { index, item -> play(index, item, false, MediaType.AUDIO) },
+                onClickPlay = { index, item ->
+                    playEntry(
+                        startIndex = state.rowSources?.getOrNull(index)?.sourceIndex ?: index,
+                        item = item,
+                        shuffle = false,
+                        mediaTypeOverride = MediaType.AUDIO,
+                        startItemId = if (isExpandedRow(index, item)) item.id else null,
+                    )
+                },
                 onClickPlayNext = { index, item -> viewModel.playNext(item) },
                 onClickAddToQueue = { item -> viewModel.addToQueue(item, Int.MAX_VALUE) },
                 onClickFavorite = { id, favorite -> viewModel.setFavorite(id, favorite) },
@@ -541,6 +806,7 @@ fun PlaylistDetails(
         loadingState = state.loading,
         playlist = state.playlist,
         items = state.items,
+        rowSources = state.rowSources,
         musicState = musicState,
         onChangeBackdrop = viewModel::updateBackdrop,
         onClickIndex = { index, item ->
@@ -594,9 +860,17 @@ fun PlaylistDetails(
             preferredSubtitleLanguage = null,
         )
     }
-    showConfirmTypeDialog?.let { (index, item, shuffle) ->
+    showConfirmTypeDialog?.let { pending ->
         ConfirmMediaTypeDialog(
-            onConfirm = { mediaType -> play(index, item, shuffle, mediaType) },
+            onConfirm = { mediaType ->
+                playEntry(
+                    startIndex = pending.startIndex,
+                    item = pending.item,
+                    shuffle = pending.shuffle,
+                    mediaTypeOverride = mediaType,
+                    startItemId = pending.startItemId,
+                )
+            },
             onCancel = { showConfirmTypeDialog = null },
         )
     }
@@ -624,6 +898,7 @@ fun PlaylistDetails(
 fun PlaylistDetailsContent(
     playlist: BaseItem?,
     items: List<BaseItem?>,
+    rowSources: List<PlaylistRowSource>?,
     musicState: MusicServiceState,
     onClickIndex: (Int, BaseItem) -> Unit,
     onShowContextMenu: (Int, BaseItem, Boolean) -> Unit,
@@ -695,6 +970,7 @@ fun PlaylistDetailsContent(
                 PlaylistItems(
                     loadingState = loadingState,
                     items = items,
+                    rowSources = rowSources,
                     musicState = musicState,
                     playButtonFocusRequester = playButtonFocusRequester,
                     onFocusItem = { index, item ->
@@ -811,6 +1087,7 @@ fun PlaylistDetailsHeader(
 fun PlaylistItems(
     loadingState: LoadingState,
     items: List<BaseItem?>,
+    rowSources: List<PlaylistRowSource>?,
     musicState: MusicServiceState,
     playButtonFocusRequester: FocusRequester,
     canMove: Boolean,
@@ -863,8 +1140,18 @@ fun PlaylistItems(
                                 ),
                             isQueued = item?.id in musicState.queuedIds,
                             canMove = canMove,
-                            moveUpAllowed = index > 0,
-                            moveDownAllowed = index < items.lastIndex,
+                            moveUpAllowed =
+                                index > 0 &&
+                                    (
+                                        rowSources == null ||
+                                            rowSources.getOrNull(index - 1)?.sourceItemId != rowSources[index].sourceItemId
+                                    ),
+                            moveDownAllowed =
+                                index < items.lastIndex &&
+                                    (
+                                        rowSources == null ||
+                                            rowSources.getOrNull(index + 1)?.sourceItemId != rowSources[index].sourceItemId
+                                    ),
                             onClickMove = { direction ->
                                 item?.let { onMoveItem.invoke(index, item.id, direction) }
                                 when (direction) {

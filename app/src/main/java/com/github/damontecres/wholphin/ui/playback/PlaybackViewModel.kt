@@ -337,6 +337,7 @@ class PlaybackViewModel
                                 shuffled = destination.shuffle,
                                 recursive = destination.recursive,
                                 filter = destination.filter,
+                                startItemId = destination.startItemId,
                             )
                         } else {
                             val shuffled =

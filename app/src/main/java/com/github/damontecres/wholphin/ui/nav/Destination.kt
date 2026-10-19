@@ -103,6 +103,7 @@ sealed class Destination(
         val shuffle: Boolean = false,
         val recursive: Boolean = false,
         val sortAndDirection: SortAndDirection? = null,
+        val startItemId: UUID? = null,
     ) : Destination(true) {
         override fun toString(): String = "PlaybackList(itemId=$itemId)"
     }

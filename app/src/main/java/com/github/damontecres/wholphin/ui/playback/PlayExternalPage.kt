@@ -119,6 +119,7 @@ class PlayExternalViewModel
                                     shuffled = destination.shuffle,
                                     recursive = destination.recursive,
                                     filter = destination.filter,
+                                    startItemId = destination.startItemId,
                                 )
                             when (val r = playlistResult) {
                                 is PlaylistCreationResult.Error -> {
